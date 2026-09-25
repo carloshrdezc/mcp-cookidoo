@@ -1,0 +1,4 @@
+# Development-only tooling (not needed to run the MCP server).
+-r requirements.txt
+ruff>=0.1.0
+black>=23.0.0
