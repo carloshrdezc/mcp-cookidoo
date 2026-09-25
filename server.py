@@ -2,12 +2,34 @@
 Cookidoo MCP Server
 
 Main server file containing MCP tool definitions for interacting with Cookidoo.
+
+Run as a stdio MCP server:
+
+    python server.py
+
+Nothing may be written to stdout: stdout carries the MCP JSON-RPC stream.
+Diagnostics go to stderr via ``logging``.
 """
 
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import sys
+
 from fastmcp import FastMCP
+
 from cookidoo_service import CookidooService, load_cookidoo_credentials
 from schemas import CustomRecipe
-import json
+
+logging.basicConfig(
+    stream=sys.stderr,
+    level=os.environ.get("COOKIDOO_LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+_LOGGER = logging.getLogger("cookidoo-mcp-server")
 
 # Initialize FastMCP server
 mcp = FastMCP("cookidoo-mcp-server")
@@ -16,117 +38,186 @@ mcp = FastMCP("cookidoo-mcp-server")
 _cookidoo_service: CookidooService | None = None
 _cookidoo_api = None
 
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _strip_html(text: str) -> str:
+    """Flatten the HTML markup the API returns for instruction text."""
+    return " ".join(_TAG_RE.sub(" ", text or "").split())
+
+
+def _minutes(seconds: int | None) -> str:
+    """Render a duration in seconds as whole minutes."""
+    if not seconds:
+        return "0 min"
+    return f"{round(seconds / 60)} min"
+
+
+def _format_ingredient(ingredient) -> str:
+    """Render an ingredient as "<quantity> <name>".
+
+    In cookidoo-api, ``name`` is the ingredient label and ``description`` the
+    quantity / extra info. Show both, falling back to whichever exists, and skip
+    the name when the description already contains it.
+    """
+    name = (getattr(ingredient, "name", None) or "").strip()
+    description = (getattr(ingredient, "description", None) or "").strip()
+    if not description:
+        return name
+    if not name or _contains_phrase(description, name):
+        return description
+    return f"{description} {name}"
+
+
+def _contains_phrase(text: str, phrase: str) -> bool:
+    """True if ``phrase`` occurs in ``text`` as a standalone word/phrase.
+
+    Case-insensitive and Unicode-aware: "Ei" is not found in "1 kleines",
+    but "Salz" is found in "1 Prise Salz".
+    """
+    pattern = r"(?<!\w)" + re.escape(phrase.casefold()) + r"(?!\w)"
+    return re.search(pattern, text.casefold()) is not None
+
+
+# A real list-numbering prefix: "1." / "2)" followed by whitespace, or a
+# bullet ("-", "•", "*") followed by whitespace. Leading quantities such as
+# "30 seg / vel 7" are left untouched.
+_STEP_PREFIX_RE = re.compile(r"^\s*(?:\d+\s*[.)]|[-•*])\s+")
+
+
+def _clean_step(step: str) -> str:
+    """Strip a list-numbering/bullet prefix and surrounding whitespace."""
+    return _STEP_PREFIX_RE.sub("", step, count=1).strip()
+
+
+def _split_items(text: str) -> list[str]:
+    """Split ingredients/hints: by newline if present, otherwise by comma.
+
+    Comma splitting only applies to single-line input, so e.g.
+    "1 diente de ajo, pelado" on one line becomes two items; send one item
+    per line to keep commas inside an item.
+    """
+    parts = text.split("\n") if "\n" in text else text.split(",")
+    return [part.strip() for part in parts if part.strip()]
+
 
 @mcp.tool()
 async def connect_to_cookidoo() -> str:
     """
     Authenticate with Cookidoo and store the session.
-    
+
     This tool must be called before using other Cookidoo tools. It will:
-    1. Load your Cookidoo credentials from the .env file
-    2. Authenticate with the Cookidoo platform
-    3. Store the authenticated session for use by other tools
-        
+    1. Read COOKIDOO_EMAIL / COOKIDOO_PASSWORD from the environment
+    2. Resolve the localization from COOKIDOO_COUNTRY / COOKIDOO_LANGUAGE
+       (defaults: mx / es-MX)
+    3. Authenticate with the Cookidoo platform and store the session
+
     Returns:
-        str: Success message confirming connection
-        
-    Raises:
-        ValueError: If credentials are missing from .env file
-        Exception: If authentication fails
+        str: Success message confirming connection (email only, never the password)
     """
     global _cookidoo_service, _cookidoo_api
-    
+
     try:
-        # Load credentials from .env file
         email, password = load_cookidoo_credentials()
-        
-        # Create Cookidoo service instance
-        _cookidoo_service = CookidooService(email, password)
-        
-        # Authenticate and get API client
-        _cookidoo_api = await _cookidoo_service.login()
-        
-        return f"Successfully connected to Cookidoo as {email}"
-        
     except ValueError as e:
-        # Missing credentials
-        return f"Configuration Error: {str(e)}\n\nPlease ensure your .env file contains COOKIDOO_EMAIL and COOKIDOO_PASSWORD"
-        
+        return (
+            f"Configuration Error: {e}\n\n"
+            "Required environment variables: COOKIDOO_EMAIL, COOKIDOO_PASSWORD. "
+            "Optional: COOKIDOO_COUNTRY (default mx), COOKIDOO_LANGUAGE (default es-MX)."
+        )
+
+    try:
+        # Replace any previous service, closing its session first.
+        if _cookidoo_service is not None:
+            await _cookidoo_service.close()
+
+        _cookidoo_service = CookidooService(email, password)
+        _cookidoo_api = await _cookidoo_service.login()
+
+        localization = _cookidoo_api.localization
+        return (
+            f"Successfully connected to Cookidoo as {email} "
+            f"(country={localization.country_code}, language={localization.language})"
+        )
+
+    except ValueError as e:
+        # Bad localization configuration.
+        _cookidoo_api = None
+        return f"Configuration Error: {e}"
+
     except Exception as e:
-        # Authentication or other errors
-        return f"Connection Failed: {str(e)}\n\nPlease check your credentials and try again."
+        _cookidoo_api = None
+        _LOGGER.warning("Cookidoo login failed: %s", e)
+        return f"Connection Failed: {e}\n\nPlease check your credentials and try again."
 
 
 @mcp.tool()
 async def get_recipe_details(recipe_id: str) -> str:
     """
     Get detailed information about a specific recipe by its ID.
-    
+
     Use this tool to get full details about a recipe for inspiration before creating
     your own custom recipe. You must be connected first using connect_to_cookidoo.
-    
+
     Args:
         recipe_id: The Cookidoo recipe ID (e.g., "r59322", "r907015")
-        
+
     Returns:
         str: Detailed recipe information including ingredients, steps, cooking time, etc.
-        
-    Raises:
-        Exception: If not connected or if the recipe is not found
     """
     global _cookidoo_api
-    
+
+    if not _cookidoo_api:
+        return "Not connected. Please run 'connect_to_cookidoo' first."
+
     try:
-        # Check if connected
-        if not _cookidoo_api:
-            return "Not connected. Please run 'connect_to_cookidoo' first."
-        
-        # Get recipe details
         recipe = await _cookidoo_api.get_recipe_details(recipe_id)
-        
-        # Format the results
-        result = f"Recipe Details:\n\n"
-        result += f"Name: {recipe.name}\n"
-        result += f"ID: {recipe.id}\n\n"
-        
-        if hasattr(recipe, 'serving_size'):
-            result += f"Servings: {recipe.serving_size}\n"
-        
-        if hasattr(recipe, 'total_time'):
-            result += f"Total Time: {recipe.total_time} minutes\n"
-        
-        if hasattr(recipe, 'difficulty'):
-            result += f"Difficulty: {recipe.difficulty}\n"
-        
-        result += "\n"
-        
-        # Ingredients
-        if hasattr(recipe, 'ingredients') and recipe.ingredients:
-            result += "Ingredients:\n"
-            for ingredient in recipe.ingredients:
-                if hasattr(ingredient, 'name'):
-                    result += f"  • {ingredient.name}"
-                    if hasattr(ingredient, 'quantity') and ingredient.quantity:
-                        result += f" - {ingredient.quantity}"
-                    result += "\n"
-            result += "\n"
-        
-        # Steps
-        if hasattr(recipe, 'steps') and recipe.steps:
-            result += "Steps:\n"
-            for i, step in enumerate(recipe.steps, 1):
-                if hasattr(step, 'description'):
-                    result += f"{i}. {step.description}\n"
-            result += "\n"
-        
-        # URL if available
-        if hasattr(recipe, 'url') and recipe.url:
-            result += f"URL: {recipe.url}\n"
-        
-        return result
-        
     except Exception as e:
-        return f"Failed to get recipe details: {str(e)}"
+        return f"Failed to get recipe details: {e}"
+
+    lines = [
+        "Recipe Details:",
+        "",
+        f"Name: {recipe.name}",
+        f"ID: {recipe.id}",
+        f"Servings: {recipe.serving_size}",
+        f"Active Time: {_minutes(recipe.active_time)}",
+        f"Total Time: {_minutes(recipe.total_time)}",
+        f"Difficulty: {recipe.difficulty}",
+        "",
+    ]
+
+    if recipe.ingredients:
+        lines.append("Ingredients:")
+        for ingredient in recipe.ingredients:
+            lines.append(f"  - {_format_ingredient(ingredient)}")
+        lines.append("")
+
+    if recipe.utensils:
+        lines.append("Utensils:")
+        lines.extend(f"  - {utensil}" for utensil in recipe.utensils)
+        lines.append("")
+
+    if recipe.step_groups:
+        lines.append("Steps:")
+        counter = 1
+        for group in recipe.step_groups:
+            if group.title:
+                lines.append(f"  [{group.title}]")
+            for step in group.recipe_steps:
+                lines.append(f"  {counter}. {_strip_html(step.formatted_text)}")
+                counter += 1
+        lines.append("")
+
+    if recipe.notes:
+        lines.append("Notes:")
+        lines.extend(f"  - {_strip_html(note)}" for note in recipe.notes)
+        lines.append("")
+
+    if recipe.url:
+        lines.append(f"URL: {recipe.url}")
+
+    return "\n".join(lines)
 
 
 @mcp.tool()
@@ -141,48 +232,36 @@ async def generate_recipe_structure(
 ) -> str:
     """
     Generate and validate a recipe structure ready for upload to Cookidoo.
-    
+
     This tool helps you structure your recipe data properly before uploading.
     It validates all fields and returns a JSON structure that can be used with
     the upload_custom_recipe tool.
-    
+
     Args:
         name: Recipe name (required)
-        ingredients: Ingredients list, one per line or comma-separated
-        steps: Cooking steps, one per line or numbered
+        ingredients: Ingredients list, one per line (commas are kept), or
+            comma-separated on a single line
+        steps: Cooking steps, one per line; "1." / "2)" / bullet prefixes are removed
         servings: Number of servings (default: 4, range: 1-20)
         prep_time: Preparation time in minutes (default: 30)
         total_time: Total cooking time in minutes (default: 60)
         hints: Optional cooking tips, one per line or comma-separated
-        
+
     Returns:
         str: Validated recipe structure in JSON format, ready for upload
     """
     try:
-        # Parse ingredients (split by newlines or commas)
-        ingredients_list = [
-            ing.strip() 
-            for ing in (ingredients.split('\n') if '\n' in ingredients else ingredients.split(','))
-            if ing.strip()
-        ]
-        
-        # Parse steps (split by newlines or numbered steps)
+        # Parse ingredients (newlines, or commas for single-line input)
+        ingredients_list = _split_items(ingredients)
+
+        # Parse steps (split by newlines, dropping list numbering only)
         steps_list = [
-            step.strip().lstrip('0123456789.)-• ')
-            for step in steps.split('\n')
-            if step.strip()
+            cleaned for cleaned in (_clean_step(s) for s in steps.split("\n")) if cleaned
         ]
-        
+
         # Parse hints if provided
-        hints_list = None
-        if hints:
-            hints_list = [
-                hint.strip()
-                for hint in (hints.split('\n') if '\n' in hints else hints.split(','))
-                if hint.strip()
-            ]
-        
-        # Create and validate the recipe using Pydantic
+        hints_list = _split_items(hints) if hints else None
+
         recipe = CustomRecipe(
             name=name,
             ingredients=ingredients_list,
@@ -190,50 +269,52 @@ async def generate_recipe_structure(
             servings=servings,
             prep_time=prep_time,
             total_time=total_time,
-            hints=hints_list
+            hints=hints_list,
         )
-        
-        # Return formatted JSON
+
         recipe_json = recipe.model_dump_json(indent=2)
-        
-        return f"Recipe structure validated successfully!\n\n{recipe_json}\n\nYou can now use this with 'upload_custom_recipe'."
-        
+
+        return (
+            "Recipe structure validated successfully!\n\n"
+            f"{recipe_json}\n\n"
+            "You can now use this with 'upload_custom_recipe'."
+        )
+
     except Exception as e:
-        return f"Validation failed: {str(e)}\n\nPlease check your recipe data and try again."
+        return f"Validation failed: {e}\n\nPlease check your recipe data and try again."
 
 
 @mcp.tool()
 async def upload_custom_recipe(recipe_json: str) -> str:
     """
-    Upload a custom recipe to your Cookidoo account.
-    
+    Upload a custom recipe to your Cookidoo account as a PRIVATE recipe.
+
     This tool creates a brand new recipe from scratch on your Cookidoo account.
     Use 'generate_recipe_structure' first to validate your recipe data, then
-    pass the resulting JSON to this tool.
-    
+    pass the resulting JSON to this tool. Uploaded recipes are always private.
+
     Args:
         recipe_json: The validated recipe JSON from generate_recipe_structure
-        
+
     Returns:
         str: Success message with the created recipe ID
     """
     global _cookidoo_service, _cookidoo_api
-    
+
+    if not _cookidoo_service or not _cookidoo_api:
+        return "Not connected. Please run 'connect_to_cookidoo' first."
+
     try:
-        # Check if connected
-        if not _cookidoo_service or not _cookidoo_api:
-            return "Not connected. Please run 'connect_to_cookidoo' first."
-        
-        # Parse and validate the recipe JSON
-        try:
-            recipe_data = json.loads(recipe_json)
-            recipe = CustomRecipe(**recipe_data)
-        except json.JSONDecodeError as e:
-            return f"Invalid JSON: {str(e)}"
-        except Exception as e:
-            return f"Invalid recipe data: {str(e)}"
-        
-        # Create the recipe using our custom service method
+        recipe_data = json.loads(recipe_json)
+    except json.JSONDecodeError as e:
+        return f"Invalid JSON: {e}"
+
+    try:
+        recipe = CustomRecipe(**recipe_data)
+    except Exception as e:
+        return f"Invalid recipe data: {e}"
+
+    try:
         recipe_id = await _cookidoo_service.create_custom_recipe(
             name=recipe.name,
             ingredients=recipe.ingredients,
@@ -241,14 +322,19 @@ async def upload_custom_recipe(recipe_json: str) -> str:
             servings=recipe.servings,
             prep_time=recipe.prep_time,
             total_time=recipe.total_time,
-            hints=recipe.hints
+            hints=recipe.hints,
         )
-        
-        # Get localization for URL
-        localization = _cookidoo_api.localization
-        recipe_url = f"https://{localization.url}/recipes/custom-recipes/{recipe_id}"
-        
-        return f"Recipe '{recipe.name}' created successfully!\n\nRecipe ID: {recipe_id}\nURL: {recipe_url}\n\nYour recipe is now saved in your Cookidoo account!"
-        
+        recipe_url = _cookidoo_service.custom_recipe_url(recipe_id)
     except Exception as e:
-        return f"Upload failed: {str(e)}"
+        return f"Upload failed: {e}"
+
+    return (
+        f"Recipe '{recipe.name}' created successfully (private)!\n\n"
+        f"Recipe ID: {recipe_id}\n"
+        f"URL: {recipe_url}\n\n"
+        "Your recipe is now saved in your Cookidoo account."
+    )
+
+
+if __name__ == "__main__":
+    mcp.run(transport="stdio", show_banner=False)
