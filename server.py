@@ -53,6 +53,22 @@ def _minutes(seconds: int | None) -> str:
     return f"{round(seconds / 60)} min"
 
 
+def _format_ingredient(ingredient) -> str:
+    """Render an ingredient as "<quantity> <name>".
+
+    In cookidoo-api, ``name`` is the ingredient label and ``description`` the
+    quantity / extra info. Show both, falling back to whichever exists, and skip
+    the name when the description already contains it.
+    """
+    name = (getattr(ingredient, "name", None) or "").strip()
+    description = (getattr(ingredient, "description", None) or "").strip()
+    if not description:
+        return name
+    if not name or name.casefold() in description.casefold():
+        return description
+    return f"{description} {name}"
+
+
 @mcp.tool()
 async def connect_to_cookidoo() -> str:
     """
@@ -142,8 +158,7 @@ async def get_recipe_details(recipe_id: str) -> str:
     if recipe.ingredients:
         lines.append("Ingredients:")
         for ingredient in recipe.ingredients:
-            text = ingredient.description or ingredient.name
-            lines.append(f"  - {text}")
+            lines.append(f"  - {_format_ingredient(ingredient)}")
         lines.append("")
 
     if recipe.utensils:

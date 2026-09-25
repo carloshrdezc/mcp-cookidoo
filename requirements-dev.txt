@@ -2,3 +2,4 @@
 -r requirements.txt
 ruff>=0.1.0
 black>=23.0.0
+pytest>=8.0.0
