@@ -300,6 +300,11 @@ class CookidooService:
                 "recipeMetadata": {"requiresAnnotationsCheck": False},
             }
 
+        except Exception as e:
+            raise Exception(f"Failed to create custom recipe: {e}") from e
+
+        # From here on the draft exists: any failure must roll it back.
+        try:
             await asyncio.sleep(_CREATE_PATCH_DELAY_SECONDS)
 
             update_url = client.api_endpoint / self._custom_recipe_path(
@@ -315,12 +320,33 @@ class CookidooService:
                 accepted_statuses=(HTTPStatus.OK, HTTPStatus.NO_CONTENT),
                 parse_response=False,
             )
+        except Exception as patch_error:
+            # The draft already exists: roll it back so no orphan is left.
+            try:
+                await client.remove_custom_recipe(recipe_id)
+            except Exception as rollback_error:
+                _LOGGER.error(
+                    "Rollback of orphan custom recipe draft %s failed: %s",
+                    recipe_id,
+                    rollback_error,
+                )
+                raise Exception(
+                    f"Failed to create custom recipe: {patch_error}. "
+                    f"The draft recipe {recipe_id} was created but could not be "
+                    f"removed automatically ({rollback_error}); delete it "
+                    "manually in Cookidoo."
+                ) from patch_error
+            _LOGGER.warning(
+                "PATCH failed; rolled back custom recipe draft %s", recipe_id
+            )
+            raise Exception(
+                f"Failed to create custom recipe: {patch_error}. "
+                f"The partially created draft {recipe_id} was rolled back "
+                "(removed); nothing was left in your account."
+            ) from patch_error
 
-            _LOGGER.info("Created private custom recipe %s", recipe_id)
-            return recipe_id
-
-        except Exception as e:
-            raise Exception(f"Failed to create custom recipe: {e}") from e
+        _LOGGER.info("Created private custom recipe %s", recipe_id)
+        return recipe_id
 
     @property
     def api_client(self) -> Optional[Cookidoo]:

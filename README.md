@@ -23,10 +23,11 @@ Uploaded recipes are always created with `workStatus: PRIVATE` and `tools: ["TM6
 
 ## Setup
 
-1. **Clone and create a virtual environment:**
+1. **Clone and create a virtual environment** (Python **3.12+** is required;
+   `cookidoo-api` 0.18.4 declares `Requires-Python >=3.12`):
    ```bash
-   python3 -m venv .venv
-   .venv/bin/pip install -r requirements.txt
+   python3.12 -m venv .venv   # or: uv venv --python 3.12
+   .venv/bin/pip install -r requirements.txt   # or: uv pip install -r requirements.txt
    ```
 
 2. **Provide configuration via environment variables** (see below). A `.env` file in the

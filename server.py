@@ -64,9 +64,41 @@ def _format_ingredient(ingredient) -> str:
     description = (getattr(ingredient, "description", None) or "").strip()
     if not description:
         return name
-    if not name or name.casefold() in description.casefold():
+    if not name or _contains_phrase(description, name):
         return description
     return f"{description} {name}"
+
+
+def _contains_phrase(text: str, phrase: str) -> bool:
+    """True if ``phrase`` occurs in ``text`` as a standalone word/phrase.
+
+    Case-insensitive and Unicode-aware: "Ei" is not found in "1 kleines",
+    but "Salz" is found in "1 Prise Salz".
+    """
+    pattern = r"(?<!\w)" + re.escape(phrase.casefold()) + r"(?!\w)"
+    return re.search(pattern, text.casefold()) is not None
+
+
+# A real list-numbering prefix: "1." / "2)" followed by whitespace, or a
+# bullet ("-", "•", "*") followed by whitespace. Leading quantities such as
+# "30 seg / vel 7" are left untouched.
+_STEP_PREFIX_RE = re.compile(r"^\s*(?:\d+\s*[.)]|[-•*])\s+")
+
+
+def _clean_step(step: str) -> str:
+    """Strip a list-numbering/bullet prefix and surrounding whitespace."""
+    return _STEP_PREFIX_RE.sub("", step, count=1).strip()
+
+
+def _split_items(text: str) -> list[str]:
+    """Split ingredients/hints: by newline if present, otherwise by comma.
+
+    Comma splitting only applies to single-line input, so e.g.
+    "1 diente de ajo, pelado" on one line becomes two items; send one item
+    per line to keep commas inside an item.
+    """
+    parts = text.split("\n") if "\n" in text else text.split(",")
+    return [part.strip() for part in parts if part.strip()]
 
 
 @mcp.tool()
@@ -207,8 +239,9 @@ async def generate_recipe_structure(
 
     Args:
         name: Recipe name (required)
-        ingredients: Ingredients list, one per line or comma-separated
-        steps: Cooking steps, one per line or numbered
+        ingredients: Ingredients list, one per line (commas are kept), or
+            comma-separated on a single line
+        steps: Cooking steps, one per line; "1." / "2)" / bullet prefixes are removed
         servings: Number of servings (default: 4, range: 1-20)
         prep_time: Preparation time in minutes (default: 30)
         total_time: Total cooking time in minutes (default: 60)
@@ -218,30 +251,16 @@ async def generate_recipe_structure(
         str: Validated recipe structure in JSON format, ready for upload
     """
     try:
-        # Parse ingredients (split by newlines or commas)
-        ingredients_list = [
-            ing.strip()
-            for ing in (
-                ingredients.split("\n") if "\n" in ingredients else ingredients.split(",")
-            )
-            if ing.strip()
-        ]
+        # Parse ingredients (newlines, or commas for single-line input)
+        ingredients_list = _split_items(ingredients)
 
-        # Parse steps (split by newlines, dropping any numbering)
+        # Parse steps (split by newlines, dropping list numbering only)
         steps_list = [
-            step.strip().lstrip("0123456789.)-• ")
-            for step in steps.split("\n")
-            if step.strip()
+            cleaned for cleaned in (_clean_step(s) for s in steps.split("\n")) if cleaned
         ]
 
         # Parse hints if provided
-        hints_list = None
-        if hints:
-            hints_list = [
-                hint.strip()
-                for hint in (hints.split("\n") if "\n" in hints else hints.split(","))
-                if hint.strip()
-            ]
+        hints_list = _split_items(hints) if hints else None
 
         recipe = CustomRecipe(
             name=name,
